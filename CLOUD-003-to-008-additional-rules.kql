@@ -1,0 +1,331 @@
+// ============================================================
+// RULE ID:        CLOUD-003
+// NAME:           IAM Access Key Created Outside Approved Workflow
+// SEVERITY:       High
+// MITRE TACTIC:   Persistence (TA0003)
+// MITRE TECHNIQUE:T1098.001 — Account Manipulation: Additional Cloud Credentials
+// LOG SOURCE:     AWSCloudTrail
+// DESCRIPTION:
+//   Detects creation of IAM access keys where the creating
+//   principal is not the IAM Identity Center provisioning
+//   role or an approved automation account. Long-lived access
+//   keys created outside the approved workflow indicate either
+//   a policy violation or a persistence mechanism being
+//   established by a threat actor.
+// FALSE POSITIVES:
+//   - Emergency access key creation during an outage (document and close quickly)
+//   - Legacy integration requiring static keys (approved via exception process)
+// RESPONSE:
+//   - Verify the key creation was authorized via ITSM change record
+//   - If unauthorized: immediately disable key, investigate UserIdentityArn
+//   - SOAR: auto-disable key if source IP is external/unknown
+// AUTHOR: Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+let ApprovedKeyCreators = _GetWatchlist('ApprovedKeyCreators') | project SearchKey;
+
+AWSCloudTrail
+| where TimeGenerated >= ago(1h)
+| where EventName == "CreateAccessKey"
+| where EventSource == "iam.amazonaws.com"
+| where UserIdentityArn !in (ApprovedKeyCreators)
+| where UserIdentityType != "AWSService"
+| extend
+    KeyCreatedFor   = tostring(parse_json(ResponseElements).accessKey.userName),
+    KeyId           = tostring(parse_json(ResponseElements).accessKey.accessKeyId),
+    SelfCreation    = (UserIdentityArn has tostring(parse_json(ResponseElements).accessKey.userName)),
+    ExternalSource  = (SourceIPAddress !startswith "10." and
+                       SourceIPAddress !startswith "172." and
+                       SourceIPAddress !startswith "192.168.")
+| project
+    TimeGenerated,
+    UserIdentityArn,
+    KeyCreatedFor,
+    KeyId,
+    SelfCreation,
+    ExternalSource,
+    SourceIPAddress,
+    AWSRegion,
+    UserAgent
+| sort by TimeGenerated desc
+
+
+// ============================================================
+// RULE ID:        CLOUD-004
+// NAME:           EC2 Instance Type Changed to GPU Class
+// SEVERITY:       High
+// MITRE TACTIC:   Impact (TA0040)
+// MITRE TECHNIQUE:T1496 — Resource Hijacking (Cryptomining)
+// LOG SOURCE:     AWSCloudTrail
+// DESCRIPTION:
+//   Detects modification of EC2 instance types to GPU-optimized
+//   families (p2, p3, p4, g3, g4, g5) which are commonly used
+//   for cryptomining. Legitimate GPU use cases (ML training,
+//   rendering) are typically planned workloads — unplanned
+//   GPU instance modifications are a strong cryptomining indicator.
+//   Also detects launch of new GPU instances outside approved
+//   instance type watchlist.
+// FALSE POSITIVES:
+//   - Approved ML/AI workloads (mitigated: add to ApprovedGPUAccounts watchlist)
+//   - Video encoding pipelines (mitigated: same watchlist approach)
+// RESPONSE:
+//   - Immediately check instance CPU utilization and network egress
+//   - Review running processes on instance via SSM Session Manager
+//   - If cryptomining confirmed: activate EC2 Cryptomining IR Playbook
+// AUTHOR: Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+let GPUInstanceFamilies = dynamic(["p2.", "p3.", "p4.", "g3.", "g4.", "g5.", "inf1.", "trn1."]);
+let ApprovedGPUAccounts = _GetWatchlist('ApprovedGPUAccounts') | project SearchKey;
+
+AWSCloudTrail
+| where TimeGenerated >= ago(2h)
+| where EventName in ("ModifyInstanceAttribute", "RunInstances", "StartInstances")
+| where EventSource == "ec2.amazonaws.com"
+| where UserIdentityArn !in (ApprovedGPUAccounts)
+| extend
+    InstanceType    = tostring(parse_json(RequestParameters).instanceType),
+    InstanceId      = tostring(parse_json(RequestParameters).instanceId)
+| where InstanceType has_any (GPUInstanceFamilies)
+| project
+    TimeGenerated,
+    EventName,
+    UserIdentityArn,
+    InstanceId,
+    InstanceType,
+    SourceIPAddress,
+    AWSRegion,
+    UserAgent
+| sort by TimeGenerated desc
+
+
+// ============================================================
+// RULE ID:        CLOUD-005
+// NAME:           Mass S3 DeleteObject Outside Maintenance Window
+// SEVERITY:       Critical
+// MITRE TACTIC:   Impact (TA0040)
+// MITRE TECHNIQUE:T1485 — Data Destruction
+// LOG SOURCE:     AWSCloudTrail
+// DESCRIPTION:
+//   Detects mass deletion of S3 objects (>100 objects in 30 minutes)
+//   outside of defined maintenance windows. High-volume S3 deletions
+//   outside maintenance windows are indicative of ransomware or
+//   destructive attack activity. Maintenance window schedule is
+//   maintained in the MaintenanceWindows watchlist.
+// FALSE POSITIVES:
+//   - Approved data lifecycle management jobs (add to ApprovedDeletion watchlist)
+//   - Bucket cleanup after application decommission (should have change record)
+// RESPONSE: CRITICAL — SOAR auto-response:
+//   1. Immediately enable S3 Object Lock on affected buckets (if not enabled)
+//   2. Check S3 Versioning status — if enabled, objects may be recoverable
+//   3. Alert CISO and activate Mass Deletion IR Playbook
+// AUTHOR: Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+let DeletionThreshold = 100;
+let LookbackWindow = 30m;
+let ApprovedDeletion = _GetWatchlist('ApprovedDeletionAccounts') | project SearchKey;
+
+AWSCloudTrail
+| where TimeGenerated >= ago(LookbackWindow)
+| where EventName in ("DeleteObject", "DeleteObjects")
+| where EventSource == "s3.amazonaws.com"
+| where UserIdentityArn !in (ApprovedDeletion)
+| where UserIdentityType != "AWSService"
+| summarize
+    DeletionCount   = count(),
+    AffectedBuckets = make_set(tostring(parse_json(RequestParameters).bucketName), 10),
+    SourceIPs       = make_set(SourceIPAddress, 5),
+    FirstEvent      = min(TimeGenerated),
+    LastEvent       = max(TimeGenerated)
+    by UserIdentityArn, AWSRegion
+| where DeletionCount >= DeletionThreshold
+| extend AlertSeverity = case(DeletionCount >= 1000, "Critical", "High")
+| project
+    TimeGenerated = FirstEvent,
+    AlertSeverity,
+    UserIdentityArn,
+    DeletionCount,
+    AffectedBuckets,
+    SourceIPs,
+    AWSRegion,
+    FirstEvent,
+    LastEvent
+| sort by DeletionCount desc
+
+
+// ============================================================
+// RULE ID:        CLOUD-006
+// NAME:           Azure AD Sign-in from Impossible Travel Location
+// SEVERITY:       High
+// MITRE TACTIC:   Initial Access (TA0001)
+// MITRE TECHNIQUE:T1078.004 — Valid Accounts: Cloud Accounts
+// LOG SOURCE:     SigninLogs (Azure AD)
+// DESCRIPTION:
+//   Detects Azure AD sign-in events where the same user account
+//   authenticates from two geographically distant locations within
+//   a time window that makes physical travel impossible (>500 km
+//   in <2 hours). This indicates credential compromise or VPN/proxy
+//   usage to mask the true location.
+//   Note: Azure AD Identity Protection also provides this signal
+//   natively — this rule provides additional context by enriching
+//   with prior sign-in patterns and correlating with AWS IAM
+//   Identity Center federation events.
+// FALSE POSITIVES:
+//   - VPN usage (mitigated: add corporate VPN exit IPs to watchlist)
+//   - Split tunneling configurations (mitigated: same)
+//   - Users who legitimately travel internationally (review case-by-case)
+// RESPONSE:
+//   - Immediately suspend user session in Azure AD
+//   - Verify with user via phone (not email — may be compromised)
+//   - If unverified: disable Azure AD account and revoke all tokens
+//   - Check for any AWS actions taken via Identity Center federation
+// AUTHOR: Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+let ImpossibleTravelThresholdKm = 500;
+let ImpossibleTravelWindowHours = 2;
+let CorporateVPNIPs = _GetWatchlist('CorporateVPNExitIPs') | project SearchKey;
+
+SigninLogs
+| where TimeGenerated >= ago(24h)
+| where ResultType == 0
+| where IPAddress !in (CorporateVPNIPs)
+| where isnotempty(LocationDetails)
+| extend
+    CountryCode     = tostring(parse_json(LocationDetails).countryOrRegion),
+    City            = tostring(parse_json(LocationDetails).city),
+    Lat             = todouble(parse_json(LocationDetails).geoCoordinates.latitude),
+    Lon             = todouble(parse_json(LocationDetails).geoCoordinates.longitude)
+| where isnotempty(Lat) and isnotempty(Lon)
+| summarize
+    Locations       = make_list(pack("time", TimeGenerated, "ip", IPAddress,
+                                     "country", CountryCode, "city", City,
+                                     "lat", Lat, "lon", Lon)),
+    SigninCount     = count()
+    by UserPrincipalName
+| where array_length(Locations) >= 2
+| mv-expand L1 = Locations, L2 = Locations
+| where tostring(L1.time) < tostring(L2.time)
+| extend
+    TimeDiffHours   = datetime_diff('hour', todatetime(L2.time), todatetime(L1.time)),
+    DistanceKm      = geo_distance_2points(todouble(L1.lon), todouble(L1.lat),
+                                            todouble(L2.lon), todouble(L2.lat)) / 1000
+| where TimeDiffHours <= ImpossibleTravelWindowHours
+| where DistanceKm >= ImpossibleTravelThresholdKm
+| extend SpeedKmH = DistanceKm / TimeDiffHours
+| project
+    UserPrincipalName,
+    Location1       = strcat(tostring(L1.city), ", ", tostring(L1.country)),
+    Location2       = strcat(tostring(L2.city), ", ", tostring(L2.country)),
+    IP1             = tostring(L1.ip),
+    IP2             = tostring(L2.ip),
+    TimeDiffHours,
+    DistanceKm      = round(DistanceKm, 0),
+    SpeedKmH        = round(SpeedKmH, 0),
+    Time1           = todatetime(L1.time),
+    Time2           = todatetime(L2.time)
+| sort by DistanceKm desc
+
+
+// ============================================================
+// RULE ID:        CLOUD-007
+// NAME:           IAM Policy Modified by Non-Admin Principal
+// SEVERITY:       High
+// MITRE TACTIC:   Privilege Escalation (TA0004)
+// MITRE TECHNIQUE:T1098 — Account Manipulation
+// LOG SOURCE:     AWSCloudTrail
+// DESCRIPTION:
+//   Detects creation or modification of IAM policies by principals
+//   who are not in the approved IAM admin role list. This indicates
+//   either a misconfigured SCP (the deny-IAM-self-modification SCP
+//   failed) or a privilege escalation attempt by a compromised
+//   non-admin account.
+// FALSE POSITIVES: Very low — policy changes by non-admin roles
+//   indicate either a control failure or active privilege escalation.
+// RESPONSE:
+//   - Immediately review the policy change for privilege escalation content
+//   - Check if SCP is correctly attached and functioning
+//   - If escalation attempted: isolate principal, rotate credentials
+// AUTHOR: Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+let ApprovedIAMAdmins = _GetWatchlist('ApprovedIAMAdmins') | project SearchKey;
+
+AWSCloudTrail
+| where TimeGenerated >= ago(1h)
+| where EventSource == "iam.amazonaws.com"
+| where EventName in (
+    "CreatePolicy", "CreatePolicyVersion", "SetDefaultPolicyVersion",
+    "AttachRolePolicy", "AttachUserPolicy", "AttachGroupPolicy",
+    "PutRolePolicy", "PutUserPolicy", "PutGroupPolicy",
+    "DeletePolicy", "DetachRolePolicy"
+  )
+| where UserIdentityArn !in (ApprovedIAMAdmins)
+| where UserIdentityType !in ("AWSService")
+| where UserIdentityArn !has "cloudformation"
+| extend
+    AffectedResource    = tostring(parse_json(RequestParameters).policyArn),
+    PolicyDocument      = tostring(parse_json(RequestParameters).policyDocument),
+    ContainsAdmin       = (tostring(parse_json(RequestParameters).policyDocument)
+                           has "\"*\"" or
+                           tostring(parse_json(RequestParameters).policyDocument)
+                           has "AdministratorAccess")
+| project
+    TimeGenerated,
+    EventName,
+    UserIdentityArn,
+    AffectedResource,
+    ContainsAdmin,
+    SourceIPAddress,
+    AWSRegion,
+    UserAgent,
+    ErrorCode
+| sort by ContainsAdmin desc, TimeGenerated desc
+
+
+// ============================================================
+// RULE ID:        CLOUD-008
+// NAME:           Root Account API Activity Detected
+// SEVERITY:       Critical
+// MITRE TACTIC:   Initial Access (TA0001)
+// MITRE TECHNIQUE:T1078.004 — Valid Accounts: Cloud Accounts
+// LOG SOURCE:     AWSCloudTrail
+// DESCRIPTION:
+//   Detects any API activity performed using root account credentials.
+//   Root account activity should NEVER occur in normal operations
+//   after the IAM governance program is in place. Any root API call
+//   is either a control failure (root keys not removed) or an active
+//   compromise of root credentials.
+//   This rule has ZERO false positive tolerance — any alert must be
+//   treated as a Critical incident until proven otherwise.
+// RESPONSE: CRITICAL — SOAR auto-response:
+//   1. Immediately page CISO and on-call security analyst
+//   2. Identify which account the root activity occurred in
+//   3. Verify whether root access keys exist (should be zero)
+//   4. If active compromise: initiate account isolation procedure
+// AUTHOR: Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+AWSCloudTrail
+| where TimeGenerated >= ago(1h)
+| where UserIdentityType == "Root"
+| where EventName != "ConsoleLogin"
+| extend
+    AccountId       = tostring(parse_json(UserIdentity).accountId),
+    IsConsoleAction = (UserAgent has "signin.amazonaws.com"),
+    IsAPIAction     = (not(UserAgent has "signin.amazonaws.com"))
+| project
+    TimeGenerated,
+    AccountId,
+    EventName,
+    EventSource,
+    SourceIPAddress,
+    UserAgent,
+    IsConsoleAction,
+    IsAPIAction,
+    AWSRegion,
+    RequestParameters,
+    ErrorCode,
+    ErrorMessage
+| sort by TimeGenerated desc

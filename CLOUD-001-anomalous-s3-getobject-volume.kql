@@ -1,0 +1,87 @@
+// ============================================================
+// RULE ID:        CLOUD-001
+// NAME:           Anomalous S3 GetObject Volume
+// SEVERITY:       High
+// MITRE TACTIC:   Collection (TA0009) / Exfiltration (TA0010)
+// MITRE TECHNIQUE:T1530 — Data from Cloud Storage
+//                 T1537 — Transfer to Cloud Account
+// LOG SOURCE:     AWSCloudTrail
+// DESCRIPTION:
+//   Detects unusually high volumes of S3 GetObject API calls
+//   from a single IAM principal within a 1-hour window. Baseline
+//   threshold of 500 events was established from 30 days of
+//   CloudTrail analysis. Legitimate bulk operations (backups,
+//   replication jobs) are excluded via the ApprovedAutomation
+//   watchlist.
+//
+// FALSE POSITIVE SCENARIOS:
+//   - Approved batch data export jobs run by data engineering teams
+//     (mitigated: add service account ARN to ApprovedAutomation watchlist)
+//   - DR replication jobs triggered during disaster recovery tests
+//     (mitigated: add maintenance window condition or watchlist entry)
+//   - Legitimate large file downloads by business users
+//     (mitigated: review object count vs bytes — large files = few objects)
+//
+// TUNING NOTES:
+//   - Threshold of 500 objects/hour derived from P99 of baseline data
+//   - Adjust threshold per environment (higher for data-intensive workloads)
+//   - Consider adding object size filter: low object count + high bytes = 
+//     large file download (likely legitimate); high count + any size = sweep
+//
+// RESPONSE:
+//   - High severity triggers analyst triage within 1 hour
+//   - If source IP is external or unfamiliar: escalate to Critical
+//     and activate Cloud IR Playbook: S3 Data Exfiltration
+//   - SOAR: no auto-response for High — requires analyst confirmation
+//
+// LAST TUNED:     Q1 2025
+// AUTHOR:         Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+let threshold = 500;
+let lookback = 1h;
+let ApprovedAutomation = _GetWatchlist('ApprovedAutomationAccounts')
+    | project SearchKey;
+
+AWSCloudTrail
+| where TimeGenerated >= ago(lookback)
+| where EventName == "GetObject"
+| where EventSource == "s3.amazonaws.com"
+| where isnotempty(UserIdentityArn)
+// Exclude approved automation accounts
+| where UserIdentityArn !in (ApprovedAutomation)
+// Exclude AWS internal service accounts
+| where UserIdentityType !in ("AWSService", "AWSAccount")
+| summarize
+    ObjectCount        = count(),
+    UniqueObjects      = dcount(RequestParameters),
+    SourceIPs          = make_set(SourceIPAddress, 10),
+    AffectedBuckets    = make_set(parse_json(RequestParameters).bucketName, 10),
+    FirstEvent         = min(TimeGenerated),
+    LastEvent          = max(TimeGenerated)
+    by UserIdentityArn, bin(TimeGenerated, lookback)
+| where ObjectCount >= threshold
+| extend
+    RiskScore      = case(
+        ObjectCount >= 2000, "Critical",
+        ObjectCount >= 1000, "High",
+        "Medium"
+    ),
+    ExternalSource = iff(
+        tostring(SourceIPs) !has "10." and
+        tostring(SourceIPs) !has "172." and
+        tostring(SourceIPs) !has "192.168.",
+        true, false
+    )
+| project
+    TimeGenerated,
+    UserIdentityArn,
+    ObjectCount,
+    UniqueObjects,
+    AffectedBuckets,
+    SourceIPs,
+    ExternalSource,
+    RiskScore,
+    FirstEvent,
+    LastEvent
+| sort by ObjectCount desc

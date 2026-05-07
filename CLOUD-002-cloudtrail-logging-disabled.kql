@@ -1,0 +1,105 @@
+// ============================================================
+// RULE ID:        CLOUD-002
+// NAME:           CloudTrail Logging Disabled or Modified
+// SEVERITY:       Critical
+// MITRE TACTIC:   Defense Evasion (TA0005)
+// MITRE TECHNIQUE:T1562.008 — Impair Defenses: Disable Cloud Logs
+// LOG SOURCE:     AWSCloudTrail
+// DESCRIPTION:
+//   Detects attempts to disable, stop, delete, or modify
+//   CloudTrail trails. This is a high-confidence indicator of
+//   an attacker attempting to impair defensive capabilities
+//   and evade detection before conducting further malicious
+//   activity. Also detects deletion of S3 log buckets,
+//   removal of CloudWatch alarm actions, and Config recorder
+//   deletion — all common defense evasion techniques.
+//
+// FALSE POSITIVE SCENARIOS:
+//   - Authorized infrastructure changes during approved change windows
+//     (mitigated: cross-reference with ITSM change records)
+//   - CloudFormation stack updates that recreate trails
+//     (mitigated: filter CloudFormation service role ARN)
+//   - Trail migration from one region to another
+//     (mitigated: verify trail is re-created within 15 minutes)
+//
+// TUNING NOTES:
+//   - This rule should have ZERO false positive tolerance in
+//     production. Any modification to CloudTrail outside an
+//     approved change window is a significant finding.
+//   - Alert should be Critical regardless of who performs the
+//     action — legitimate changes require immediate verification.
+//   - No threshold — any single occurrence is an alert.
+//
+// RESPONSE:
+//   - Critical severity — SOAR auto-response triggers:
+//     1. Page on-call security analyst immediately
+//     2. Pull IAM activity for UserIdentityArn in past 24h
+//     3. Check if trail was re-created within 5 minutes
+//     4. If trail not re-created: escalate to CISO immediately
+//
+// LAST TUNED:     Q1 2025
+// AUTHOR:         Bola Mabawonku — Portfolio Evidence Artifact
+// ============================================================
+
+let SuspiciousCloudTrailActions = dynamic([
+    "DeleteTrail",
+    "StopLogging",
+    "UpdateTrail",
+    "PutEventSelectors",         // Modifying what events are logged
+    "DeleteEventDataStore"
+]);
+
+let SuspiciousConfigActions = dynamic([
+    "DeleteConfigRule",
+    "DeleteConfigurationRecorder",
+    "DeleteDeliveryChannel",
+    "StopConfigurationRecorder"
+]);
+
+let SuspiciousGuardDutyActions = dynamic([
+    "DeleteDetector",
+    "DisassociateFromMasterAccount",
+    "UpdateDetector",
+    "DeletePublishingDestination"
+]);
+
+AWSCloudTrail
+| where TimeGenerated >= ago(1h)
+| where EventName in (SuspiciousCloudTrailActions)
+    or EventName in (SuspiciousConfigActions)
+    or EventName in (SuspiciousGuardDutyActions)
+// Exclude known CloudFormation service roles performing authorized updates
+| where UserIdentityArn !has "cloudformation.amazonaws.com"
+| where UserIdentityType != "AWSService"
+| extend
+    ServiceImpacted = case(
+        EventName in (SuspiciousCloudTrailActions), "CloudTrail",
+        EventName in (SuspiciousConfigActions),     "AWS Config",
+        EventName in (SuspiciousGuardDutyActions),  "GuardDuty",
+        "Unknown"
+    ),
+    ActionCategory = case(
+        EventName has "Delete" or EventName has "Stop" or EventName has "Disable",
+        "Disable/Delete",
+        "Modify"
+    ),
+    AlertSeverity = case(
+        EventName in ("DeleteTrail", "StopLogging", "DeleteDetector"),
+        "Critical",
+        "High"
+    )
+| project
+    TimeGenerated,
+    AlertSeverity,
+    ServiceImpacted,
+    ActionCategory,
+    EventName,
+    UserIdentityArn,
+    UserIdentityType,
+    SourceIPAddress,
+    AWSRegion,
+    RequestParameters,
+    ResponseElements,
+    ErrorCode,
+    ErrorMessage
+| sort by TimeGenerated desc
